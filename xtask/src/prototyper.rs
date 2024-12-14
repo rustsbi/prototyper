@@ -21,11 +21,12 @@ pub struct PrototyperArg {
 }
 
 #[must_use]
+#[rustfmt::skip]
 pub fn run(arg: &PrototyperArg) -> Option<ExitStatus> {
     let arch = "riscv64imac-unknown-none-elf";
     let fdt = arg.fdt.clone();
     let payload = arg.payload.clone();
-
+    
     cargo::Cargo::new("build")
         .package("rustsbi-prototyper")
         .target(arch)

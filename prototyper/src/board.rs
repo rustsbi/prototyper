@@ -8,6 +8,7 @@ use sifive_test_device::SifiveTestDevice;
 use spin::Mutex;
 use uart16550::Uart16550;
 use uart_xilinx::uart_lite::uart::MmioUartAxiLite;
+use volatile_register::RW;
 
 use crate::fail;
 use crate::sbi::console::{ConsoleDevice, SbiConsole};
@@ -26,6 +27,7 @@ pub(crate) const UART16650U32_COMPATIBLE: [&str; 1] = ["snps,dw-apb-uart"];
 pub(crate) const UARTAXILITE_COMPATIBLE: [&str; 1] = ["xlnx,xps-uartlite-1.00.a"];
 pub(crate) const SIFIVETEST_COMPATIBLE: [&str; 1] = ["sifive,test0"];
 pub(crate) const SIFIVECLINT_COMPATIBLE: [&str; 1] = ["riscv,clint0"];
+pub(crate) const THEADCLINT_COMPATIBLE: [&str; 1] = ["thead,c910-clint"];
 
 type BaseAddress = usize;
 /// Store finite-length string on the stack.
@@ -67,7 +69,7 @@ impl BoardInfo {
 
 pub struct Board {
     pub info: BoardInfo,
-    pub sbi: SBI<MachineConsole, SifiveClint, SifiveTestDevice>,
+    pub sbi: SBI<MachineConsole, ClintDevice, SifiveTestDevice>,
     pub ready: AtomicBool,
 }
 
@@ -83,7 +85,7 @@ impl Board {
 
     pub fn init(&mut self, fdt_address: usize) {
         self.info_init(fdt_address);
-        self.sbi_init();
+        self.sbi_init(fdt_address);
         logger::Logger::init().unwrap();
         trap_stack::prepare_for_trap();
         self.ready.swap(true, Ordering::Release);
@@ -169,7 +171,9 @@ impl Board {
                 let base_address = regs.start;
                 for device_id in compatible.iter() {
                     // Initialize clint device.
-                    if SIFIVECLINT_COMPATIBLE.contains(&device_id) {
+                    if SIFIVECLINT_COMPATIBLE.contains(&device_id)
+                        || THEADCLINT_COMPATIBLE.contains(&device_id)
+                    {
                         self.info.ipi = Some(base_address);
                     }
                     // Initialize reset device.
@@ -221,9 +225,9 @@ impl Board {
         self.info.cpu_enabled = Some(cpu_list);
     }
 
-    fn sbi_init(&mut self) {
+    fn sbi_init(&mut self, fdt_address: usize) {
         self.sbi_console_init();
-        self.sbi_ipi_init();
+        self.sbi_ipi_init(fdt_address);
         self.sbi_hsm_init();
         self.sbi_reset_init();
         self.sbi_rfence_init();
@@ -252,12 +256,41 @@ impl Board {
         }
     }
 
-    fn sbi_ipi_init(&mut self) {
+    fn sbi_ipi_init(&mut self, fdt_address: usize) {
         if let Some(base) = self.info.ipi {
-            self.sbi.ipi = Some(SbiIpi::new(
-                AtomicPtr::new(base as _),
-                self.info.cpu_num.unwrap_or(NUM_HART_MAX),
-            ));
+            let dtb = dt::parse_device_tree(fdt_address).unwrap_or_else(fail::device_tree_format);
+            let dtb = dtb.share();
+            let root: serde_device_tree::buildin::Node = serde_device_tree::from_raw_mut(&dtb)
+                .unwrap_or_else(fail::device_tree_deserialize_root);
+
+            let mut find_device = |node: &serde_device_tree::buildin::Node| {
+                if let Some((compatible, regs)) = dt::get_compatible_and_range(node) {
+                    if regs.start == base {
+                        for device_id in compatible.iter() {
+                            if SIFIVECLINT_COMPATIBLE.contains(&device_id) {
+                                if let Some(clint) = ClintDevice::get_sifive_clint(base) {
+                                    self.sbi.ipi = Some(SbiIpi::new(
+                                        AtomicPtr::new(clint as *const _ as *mut _),
+                                        NUM_HART_MAX,
+                                    ));
+                                    return;
+                                }
+                            }
+                            if THEADCLINT_COMPATIBLE.contains(&device_id) {
+                                if let Some(clint) = ClintDevice::get_thead_clint(base) {
+                                    self.sbi.ipi = Some(SbiIpi::new(
+                                        AtomicPtr::new(clint as *const _ as *mut _),
+                                        NUM_HART_MAX,
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            root.search(&mut find_device);
         } else {
             self.sbi.ipi = None;
         }
@@ -322,41 +355,178 @@ impl ConsoleDevice for MachineConsole {
     }
 }
 
-/// Ipi Device: Sifive Clint
-impl IpiDevice for SifiveClint {
+#[allow(unused)]
+pub enum ClintDevice {
+    SifiveClint(*const SifiveClint),
+    THeadClint(*const THeadClint),
+}
+
+impl ClintDevice {
+    pub fn get_sifive_clint(base: BaseAddress) -> Option<*const SifiveClint> {
+        Some(base as *const SifiveClint)
+    }
+
+    pub fn get_thead_clint(base: BaseAddress) -> Option<*const THeadClint> {
+        Some(base as *const THeadClint)
+    }
+}
+
+impl IpiDevice for ClintDevice {
     #[inline(always)]
     fn read_mtime(&self) -> u64 {
-        self.read_mtime()
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).read_mtime() },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).read_mtime() },
+        }
     }
 
     #[inline(always)]
     fn write_mtime(&self, val: u64) {
-        self.write_mtime(val)
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).write_mtime(val) },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).write_mtime(val) },
+        }
     }
 
     #[inline(always)]
     fn read_mtimecmp(&self, hart_idx: usize) -> u64 {
-        self.read_mtimecmp(hart_idx)
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).read_mtimecmp(hart_idx) },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).read_mtimecmp(hart_idx) },
+        }
     }
 
     #[inline(always)]
     fn write_mtimecmp(&self, hart_idx: usize, val: u64) {
-        self.write_mtimecmp(hart_idx, val)
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).write_mtimecmp(hart_idx, val) },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).write_mtimecmp(hart_idx, val) },
+        }
     }
 
     #[inline(always)]
     fn read_msip(&self, hart_idx: usize) -> bool {
-        self.read_msip(hart_idx)
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).read_msip(hart_idx) },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).read_msip(hart_idx) },
+        }
     }
 
     #[inline(always)]
     fn set_msip(&self, hart_idx: usize) {
-        self.set_msip(hart_idx)
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).set_msip(hart_idx) },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).set_msip(hart_idx) },
+        }
     }
 
     #[inline(always)]
     fn clear_msip(&self, hart_idx: usize) {
-        self.clear_msip(hart_idx)
+        match self {
+            ClintDevice::SifiveClint(clint) => unsafe { (**clint).clear_msip(hart_idx) },
+            ClintDevice::THeadClint(clint) => unsafe { (**clint).clear_msip(hart_idx) },
+        }
+    }
+}
+
+/// T-Head Clint Register Structures
+#[repr(transparent)]
+pub struct MSIP(RW<u32>);
+
+#[repr(C)]
+pub struct MTIMECMP {
+    mtimecmpl: RW<u32>,
+    mtimecmph: RW<u32>,
+}
+
+#[repr(transparent)]
+pub struct SSIP(RW<u32>);
+
+#[repr(C)]
+pub struct STIMECMP {
+    stimecmpl: RW<u32>,
+    stimecmph: RW<u32>,
+}
+
+/// Register block for T-Head Clint
+#[repr(C)]
+pub struct THeadClint {
+    msip: [MSIP; 4096],
+    mtimecmp: [MTIMECMP; 4096],
+    ssip: [SSIP; 1024],
+    stimecmp: [STIMECMP; 1024],
+}
+
+#[allow(unused)]
+impl THeadClint {
+    #[inline]
+    pub fn read_msip(&self, hart_idx: usize) -> bool {
+        self.msip[hart_idx].0.read() != 0
+    }
+
+    #[inline]
+    pub fn set_msip(&self, hart_idx: usize) {
+        unsafe { self.msip[hart_idx].0.write(1) }
+    }
+
+    #[inline]
+    pub fn clear_msip(&self, hart_idx: usize) {
+        unsafe { self.msip[hart_idx].0.write(0) }
+    }
+
+    #[inline]
+    pub fn read_mtimecmp(&self, hart_idx: usize) -> u64 {
+        let mtimecmpl = self.mtimecmp[hart_idx].mtimecmpl.read();
+        let mtimecmph = self.mtimecmp[hart_idx].mtimecmph.read();
+        ((mtimecmph as u64) << 32) | mtimecmpl as u64
+    }
+
+    #[inline]
+    pub fn write_mtimecmp(&self, hart_idx: usize, val: u64) {
+        let mtimecmpl: u32 = (val & 0xffffffff) as u32;
+        let mtimecmph: u32 = (val >> 32) as u32;
+        unsafe { self.mtimecmp[hart_idx].mtimecmpl.write(mtimecmpl) }
+        unsafe { self.mtimecmp[hart_idx].mtimecmph.write(mtimecmph) }
+    }
+
+    #[inline]
+    pub fn read_mtime(&self) -> u64 {
+        0 // Placeholder
+    }
+
+    #[inline]
+    pub fn write_mtime(&self, _val: u64) {
+        // Placeholder
+    }
+
+    #[inline]
+    pub fn read_ssip(&self, hart_idx: usize) -> bool {
+        self.ssip[hart_idx].0.read() != 0
+    }
+
+    #[inline]
+    pub fn set_ssip(&self, hart_idx: usize) {
+        unsafe { self.ssip[hart_idx].0.write(1) }
+    }
+
+    #[inline]
+    pub fn clear_ssip(&self, hart_idx: usize) {
+        unsafe { self.ssip[hart_idx].0.write(0) }
+    }
+
+    #[inline]
+    pub fn read_stimecmp(&self, hart_idx: usize) -> u64 {
+        let stimecmpl = self.stimecmp[hart_idx].stimecmpl.read();
+        let stimecmph = self.stimecmp[hart_idx].stimecmph.read();
+        ((stimecmph as u64) << 32) | stimecmpl as u64
+    }
+
+    #[inline]
+    pub fn write_stimecmp(&self, hart_idx: usize, val: u64) {
+        let stimecmpl: u32 = (val & 0xffffffff) as u32;
+        let stimecmph: u32 = (val >> 32) as u32;
+        unsafe { self.stimecmp[hart_idx].stimecmpl.write(stimecmpl) }
+        unsafe { self.stimecmp[hart_idx].stimecmph.write(stimecmph) }
     }
 }
 
