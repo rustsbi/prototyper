@@ -323,6 +323,7 @@ dependencies = [
  "spin",
  "uart16550",
  "uart_xilinx",
+ "volatile-register",
 ]
 
 [[package]]
