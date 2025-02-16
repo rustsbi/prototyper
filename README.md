@@ -1,3 +1,7 @@
+# Repository archived
+
+This crate has been moved to repository [rustsbi/rustsbi](https://github.com/rustsbi/rustsbi). Please direct issues and pull requests to the new repository.
+
 # RustSBI Prototyper
 
 RustSBI Prototyper is a developing RISC-V Secure Bootloader solution. It can be integrated with the Rust or C language ecosystem to form a complete RISC-V bootloader ecosystem.
